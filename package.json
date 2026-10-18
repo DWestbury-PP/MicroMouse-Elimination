@@ -1,0 +1,15 @@
+{
+  "name": "micromouse-grand-prix",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Browser MicroMouse elimination championship with a deterministic simulation engine.",
+  "scripts": {
+    "test": "node --test tests/",
+    "balance": "node tests/balance.js",
+    "serve": "python3 -m http.server 8765 --bind 127.0.0.1",
+    "deploy": "node scripts/deploy.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
