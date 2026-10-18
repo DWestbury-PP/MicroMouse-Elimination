@@ -12,7 +12,7 @@
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
   // ------------------------------------------------------------ storage
-  const KEYS = { settings: 'mmgp2-settings', records: 'mmgp2-records', history: 'mmgp2-history' };
+  const KEYS = { settings: 'mmgp2-settings', records: 'mmgp2-records', history: 'mmgp2-history', season: 'mmgp2-season' };
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode: keep going */ } },
@@ -28,6 +28,8 @@
   const hex = (n) => (n >>> 0).toString(16).toUpperCase().padStart(8, '0');
   const randomSeed = () => (Math.random() * 2 ** 32) >>> 0;
   const team = (id) => S.TEAM_BY_ID[id];
+  // The player's team can carry a custom name; everything displayed goes through here.
+  const nameOf = (id) => (id === settings.playerTeam && settings.teamName ? settings.teamName : (team(id) || { name: id }).name);
 
   // ------------------------------------------------------------ settings + state
   const DEFAULT_VIEW = { trails: true, sensors: true, fog: false, flood: false, ideal: false };
@@ -39,6 +41,8 @@
     build: S.normalizeBuild(saved.build || S.DEFAULT_BUILD),
     speed: [0.5, 1, 2, 4, 8, 16, 32].includes(saved.speed) ? saved.speed : 2,
     view: { ...DEFAULT_VIEW, ...(saved.view || {}) },
+    sound: saved.sound !== false,
+    teamName: typeof saved.teamName === 'string' ? saved.teamName.slice(0, 24) : '',
   };
   const saveSettings = () => store.set(KEYS.settings, settings);
 
@@ -55,6 +59,8 @@
     nextSeed: randomSeed(),
     lap: null,
     tune: null,
+    countdown: null,       // { start, lit } while the start lights run
+    realRace: null,        // the full race, kept while a showdown replay is shown
   };
 
   // Share links: #s=SEED&m=adv&sc=best&t=team&b=build
@@ -520,15 +526,120 @@
     }
   }
 
+  // ------------------------------------------------------------ sound (synthesised, no assets)
+  const sfx = (() => {
+    let ac = null, master = null, noiseBuf = null;
+    function ensure() {
+      if (!settings.sound) return null;
+      if (!ac) {
+        try {
+          ac = new (window.AudioContext || window.webkitAudioContext)();
+          master = ac.createGain(); master.gain.value = 0.16; master.connect(ac.destination);
+          noiseBuf = ac.createBuffer(1, ac.sampleRate * 0.5, ac.sampleRate);
+          const d = noiseBuf.getChannelData(0);
+          for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        } catch { return null; }
+      }
+      if (ac.state === 'suspended') ac.resume();
+      return ac;
+    }
+    function tone(freq, dur, type, when, vol, slide) {
+      const a = ensure();
+      if (!a) return;
+      const t0 = a.currentTime + (when || 0), o = a.createOscillator(), g = a.createGain();
+      o.type = type || 'sine';
+      o.frequency.setValueAtTime(freq, t0);
+      if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq * slide), t0 + dur);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(vol || 0.6, t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g); g.connect(master); o.start(t0); o.stop(t0 + dur + 0.03);
+    }
+    function crunch(dur, vol) {
+      const a = ensure();
+      if (!a) return;
+      const src = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain(), t0 = a.currentTime;
+      src.buffer = noiseBuf; f.type = 'lowpass';
+      f.frequency.setValueAtTime(2400, t0); f.frequency.exponentialRampToValueAtTime(200, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      src.connect(f); f.connect(g); g.connect(master); src.start(t0); src.stop(t0 + dur);
+    }
+    return {
+      unlock: ensure,
+      light: () => tone(620, 0.16, 'square', 0, 0.35),
+      go: () => tone(1240, 0.42, 'square', 0, 0.45),
+      goal: () => { tone(880, 0.1, 'triangle', 0, 0.5); tone(1175, 0.16, 'triangle', 0.08, 0.5); },
+      finish: () => { tone(988, 0.09, 'square', 0, 0.3); tone(1319, 0.09, 'square', 0.07, 0.3); tone(1760, 0.22, 'square', 0.14, 0.3); },
+      crash: () => { crunch(0.4, 0.9); tone(240, 0.35, 'sawtooth', 0, 0.35, 0.3); },
+      slip: () => tone(520, 0.16, 'sawtooth', 0, 0.18, 0.6),
+      flat: () => tone(420, 0.6, 'triangle', 0, 0.35, 0.4),
+      advance: () => { tone(660, 0.1, 'triangle', 0, 0.5); tone(990, 0.22, 'triangle', 0.09, 0.5); },
+      champion: () => [523, 659, 784, 1047, 784, 1047].forEach((f, i) => tone(f, i === 5 ? 0.8 : 0.15, 'triangle', i * 0.13, 0.6)),
+    };
+  })();
+  ['pointerdown', 'keydown'].forEach((ev) => document.addEventListener(ev, () => sfx.unlock(), { once: true }));
+
+  // Play a sound for each race event the replay clock passes (forward play only).
+  let soundT = 0;
+  function eventSounds(prev, t) {
+    if (!state.race || t <= prev || t - prev > 1.5 || settings.speed > 8) return;
+    const played = new Set();
+    for (const row of state.race.rows) {
+      for (const k of row.result.marks) {
+        if (k.t > prev && k.t <= t && !played.has(k.type) && sfx[k.type]) { played.add(k.type); sfx[k.type](); }
+      }
+    }
+  }
+
+  // Start lights: five reds, then lights out.
+  const LIGHT_MS = 380;
+  function startCountdown() {
+    state.playing = false;
+    state.countdown = { start: performance.now(), lit: -1 };
+  }
+  function tickCountdown(now) {
+    const cd = state.countdown;
+    if (!cd) return;
+    const lit = Math.min(5, Math.floor((now - cd.start) / LIGHT_MS));
+    if (lit > cd.lit && lit < 5) { cd.lit = lit; sfx.light(); }
+    if (now - cd.start >= LIGHT_MS * 5 + 450) {
+      state.countdown = null;
+      state.playing = true;
+      sfx.go();
+      syncControls();
+    }
+  }
+  function drawCountdown(now) {
+    const cd = state.countdown;
+    if (!cd) return;
+    const lit = Math.min(5, Math.floor((now - cd.start) / LIGHT_MS) + 1);
+    const w = 5 * 34 + 24, x0 = L / 2 - w / 2, y0 = MARGIN + CS * 0.6;
+    ctx.save();
+    ctx.fillStyle = '#05080fe6'; ctx.strokeStyle = '#2a3d5c'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.roundRect(x0, y0, w, 52, 12); ctx.fill(); ctx.stroke();
+    for (let i = 0; i < 5; i++) {
+      const on = i < lit;
+      ctx.beginPath(); ctx.arc(x0 + 29 + i * 34, y0 + 26, 11, 0, Math.PI * 2);
+      ctx.fillStyle = on ? '#ff2d4b' : '#2a0d14';
+      ctx.shadowColor = '#ff2d4b'; ctx.shadowBlur = on ? 18 : 0;
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
   // ------------------------------------------------------------ main loop
   let towerKey = '', logCount = -1;
   function frame(now) {
     const dt = Math.min(0.1, (now - lastFrame) / 1000);
+    tickCountdown(now);
     if (state.playing && state.race) {
       state.t = Math.min(endOf(), state.t + dt * settings.speed);
       if (state.t >= endOf()) { state.playing = false; onRaceEnd(); syncControls(); }
     }
+    if (state.playing) eventSounds(soundT, state.t);
+    soundT = state.t;
     draw();
+    drawCountdown(now);
     lastFrame = now;
     $('clock').textContent = fmt(state.t);
     if (state.race && document.activeElement !== $('scrub')) $('scrub').value = Math.round((state.t / endOf()) * 1000);
@@ -539,10 +650,41 @@
   }
   const endOf = () => (state.race ? state.race.endT + 1.2 : 0);
 
+  // ------------------------------------------------------------ showdown
+  // Replays every mouse's best speed run side by side from a standing start.
+  function buildShowdown(race) {
+    const rows = race.rows.map((row) => {
+      const r = row.result;
+      const bi = r.best == null ? -1 : r.runs.findIndex((x) => x.time === r.best);
+      if (bi < 0) return null;
+      const run = r.runs[bi], ph = 'run' + run.n, off = run.start;
+      const moves = r.moves.filter((m) => m.ph === ph).map((m) => ({ ...m, t0: m.t0 - off, t1: m.t1 - off }));
+      const marks = r.marks.filter((k) => k.type === 'finish' && k.run === run.n).map((k) => ({ ...k, t: k.t - off }));
+      const runs = r.runs.map((x, i) => (i === bi ? { ...x, at: x.at - off, start: 0 } : { ...x, at: Infinity }));
+      const endT = moves.length ? moves[moves.length - 1].t1 : 0;
+      return { ...row, result: { ...r, moves, marks, learn: [], phases: [{ t: 0, phase: ph }], runs, endT, exploreTime: Infinity, goalTime: null } };
+    }).filter(Boolean);
+    const ranking = [...rows].sort((a, b) => a.result.best - b.result.best).map((x) => x.id);
+    return { ...race, rows, ranking, showdown: true, endT: Math.max(0, ...rows.map((x) => x.result.endT)) };
+  }
+  function toggleShowdown() {
+    if (state.race && state.race.showdown) {
+      state.race = state.realRace; state.realRace = null;
+      state.countdown = null; state.playing = false; state.t = endOf();
+    } else if (state.race && state.revealed) {
+      state.realRace = state.race;
+      state.race = buildShowdown(state.race);
+      state.t = 0;
+      $('banner').classList.add('hidden');
+      startCountdown();
+    }
+    renderAll();
+  }
+
   // ------------------------------------------------------------ flow
   function prepareIdle() {
     state.mode = 'idle';
-    state.champ = null; state.race = null; state.revealed = false; state.t = 0; state.playing = false; state.focus = null;
+    state.champ = null; state.race = null; state.realRace = null; state.countdown = null; state.revealed = false; state.t = 0; state.playing = false; state.focus = null;
     const s = state.nextSeed;
     state.setup = { name: 'Paddock', maze: S.generateMaze(S.hashSeed('round-maze', s, 0)), env: S.generateEnvironment(S.hashSeed('round-env', s, 0), settings.advanced), field: S.TEAMS.map((t) => t.id), heats: [] };
     $('banner').classList.add('hidden');
@@ -561,7 +703,7 @@
   function prepareRound(i) {
     state.roundIdx = i;
     state.setup = S.roundSetup(state.champ, i);
-    state.race = null; state.revealed = false; state.t = 0; state.playing = false;
+    state.race = null; state.realRace = null; state.countdown = null; state.revealed = false; state.t = 0; state.playing = false;
     state.mode = 'ready';
     if (state.focus && !state.setup.field.includes(state.focus)) state.focus = null;
     $('banner').classList.add('hidden');
@@ -571,9 +713,10 @@
   function runRound() {
     const rd = S.runRound(state.champ, state.roundIdx);
     state.setup = rd;
-    state.race = rd.race;
-    state.t = 0; state.playing = true; state.revealed = false;
+    state.race = rd.race; state.realRace = null;
+    state.t = 0; state.revealed = false;
     state.mode = 'racing';
+    startCountdown();
     renderAll();
   }
 
@@ -583,14 +726,15 @@
     const race = S.simulateRace(maze, env, [{ id: settings.playerTeam, build: settings.build }], { scoring: settings.scoring });
     state.champ = null;
     state.setup = { name: 'Test lap', maze, env, field: [settings.playerTeam], heats: [] };
-    state.race = race; state.t = 0; state.playing = true; state.revealed = false;
+    state.race = race; state.realRace = null; state.t = 0; state.revealed = false;
     state.mode = 'practice'; state.focus = settings.playerTeam;
+    startCountdown();
     $('banner').classList.add('hidden');
     renderAll();
   }
 
   function onRaceEnd() {
-    if (state.revealed || !state.race) return;
+    if (!state.race || state.race.showdown || state.revealed) return;
     state.revealed = true;
     if (state.mode === 'practice') {
       const row = state.race.rows[0], r = row.result;
@@ -605,14 +749,21 @@
       state.mode = 'champion';
       const champ = team(state.champ.champion);
       recordHistory();
+      const season = recordSeason();
       const mine = state.champ.champion === settings.playerTeam;
-      showBanner(`🏆 ${champ.name} are champions`, mine ? 'Your engineering won the Grand Prix!' : `${state.champ.rounds.length} rounds, ${state.champ.rounds.length} fresh mazes.`, 'New championship', newChampionship, 'champion');
+      const myPts = season.pts[settings.playerTeam] || 0;
+      const seasonLine = season.done
+        ? ` 🏁 Season ${season.done.no} champions: ${nameOf(season.done.team)} (${season.done.points} pts).`
+        : ` Season ${season.s.no}: ${season.leader ? nameOf(season.leader.id) + ' lead with ' + season.leader.pts + ' pts' : ''}.`;
+      showBanner(`🏆 ${nameOf(state.champ.champion)} are champions`, (mine ? 'Your engineering won the Grand Prix!' : `Your team scored ${myPts} pt${myPts === 1 ? '' : 's'}.`) + seasonLine, 'New championship', newChampionship, 'champion');
+      sfx.champion();
       burst([champ.color, '#ffc857', '#ffffff', shade(champ.color, 0.4)], 180);
     } else {
       state.mode = 'done';
-      const adv = rd.heats.map((h) => team(h.winner).name).join(', ');
+      const adv = rd.heats.map((h) => nameOf(h.winner)).join(', ');
       const out = settings.playerTeam && rd.field.includes(settings.playerTeam) && !rd.heats.some((h) => h.winner === settings.playerTeam);
       showBanner(`${rd.name} complete`, (out ? 'Your mouse is out. ' : '') + 'Advancing: ' + adv, 'Continue to ' + S.ROUND_NAMES[state.roundIdx + 1], () => prepareRound(state.roundIdx + 1));
+      sfx.advance();
     }
     renderAll();
   }
@@ -655,6 +806,53 @@
     store.set(KEYS.history, h.slice(0, 60));
   }
 
+  // Seasons: five championships; points by how far each team got, plus a bonus
+  // point for the fastest single speed run of the championship.
+  const SEASON_LEN = 5;
+  const POINTS = { champion: 10, final: 6, semi: 3, quarter: 1, fastest: 1 };
+  function championshipPoints(c) {
+    const pts = Object.fromEntries(c.draw.map((id) => [id, POINTS.quarter]));
+    c.rounds[1].field.forEach((id) => { pts[id] = POINTS.semi; });
+    c.rounds[2].field.forEach((id) => { pts[id] = POINTS.final; });
+    pts[c.champion] = POINTS.champion;
+    let fastest = null;
+    for (const rd of c.rounds) for (const row of rd.race.rows) {
+      if (row.result.best != null && (!fastest || row.result.best < fastest.t)) fastest = { id: row.id, t: row.result.best };
+    }
+    if (fastest) pts[fastest.id] += POINTS.fastest;
+    return { pts, fastest };
+  }
+  function seasonTable(events) {
+    const rows = S.TEAMS.map((t) => ({ id: t.id, pts: 0, wins: 0, fastest: 0 }));
+    const by = Object.fromEntries(rows.map((r) => [r.id, r]));
+    for (const e of events) {
+      for (const [id, p] of Object.entries(e.pts)) if (by[id]) by[id].pts += p;
+      if (by[e.champion]) by[e.champion].wins++;
+      if (by[e.fastest]) by[e.fastest].fastest++;
+    }
+    return rows.sort((a, b) => b.pts - a.pts || b.wins - a.wins || a.id.localeCompare(b.id));
+  }
+  function loadSeason() {
+    const s = store.get(KEYS.season, null);
+    return s && Array.isArray(s.events) ? s : { no: 1, events: [], champions: [] };
+  }
+  function recordSeason() {
+    const s = loadSeason();
+    const { pts, fastest } = championshipPoints(state.champ);
+    s.events.push({ pts, champion: state.champ.champion, fastest: fastest && fastest.id, seed: hex(state.champ.seed) });
+    let done = null;
+    if (s.events.length >= SEASON_LEN) {
+      const top = seasonTable(s.events)[0];
+      done = { no: s.no, team: top.id, points: top.pts };
+      s.champions.unshift(done);
+      s.no++;
+      s.events = [];
+    }
+    store.set(KEYS.season, s);
+    const leader = s.events.length ? seasonTable(s.events)[0] : null;
+    return { pts, done, s, leader };
+  }
+
   // ------------------------------------------------------------ rendering: chrome
   function renderAll() {
     syncControls();
@@ -685,6 +883,11 @@
     $('newBtn').classList.toggle('hidden', ['idle', 'practice', 'champion'].includes(m));
     ['restartBtn', 'skipBtn', 'scrub'].forEach((id) => { $(id).disabled = !hasRace; });
     $('playBtn').disabled = !hasRace;
+    const sd = $('showdownBtn');
+    sd.disabled = !(hasRace && (state.revealed || state.race.showdown));
+    sd.textContent = state.race && state.race.showdown ? '✕ Exit showdown' : '⚡ Speed-run showdown';
+    $('soundBtn').textContent = settings.sound ? '🔊' : '🔇';
+    $('soundBtn').setAttribute('aria-label', settings.sound ? 'Mute sound' : 'Unmute sound');
     $('playBtn').textContent = state.playing ? '❚❚' : '▶';
     $('playBtn').setAttribute('aria-label', state.playing ? 'Pause' : 'Play');
     const locked = !['idle', 'practice', 'champion'].includes(m);
@@ -712,8 +915,11 @@
     const s = state.setup;
     const seed = state.champ ? state.champ.seed : state.nextSeed;
     $('seedLabel').textContent = 'SEED ' + hex(seed);
-    if (state.mode === 'practice') {
-      $('roundEyebrow').textContent = 'Test lap · ' + team(settings.playerTeam).name;
+    if (state.race && state.race.showdown) {
+      $('roundEyebrow').textContent = 'Speed-run showdown · best runs, standing start';
+      $('roundTitle').textContent = `${s.maze.label} · ${state.race.rows.length} mice`;
+    } else if (state.mode === 'practice') {
+      $('roundEyebrow').textContent = 'Test lap · ' + nameOf(settings.playerTeam);
       $('roundTitle').textContent = s.maze.label;
     } else if (state.champ) {
       $('roundEyebrow').textContent = `Round ${state.roundIdx + 1} of 3 · ${s.name}`;
@@ -747,7 +953,7 @@
         if (t >= r.exploreTime) bits.push('search ' + secs(r.exploreTime, 2));
         for (const run of r.runs) if (t >= run.at) bits.push(`R${run.n} ${run.crashed ? 'crash' : secs(run.time)}`);
         sub = bits.join(' · ') || `${countSeen(r, t)} cells mapped`;
-        if (ph === 'done' || ph === 'dnf') { time = it.row.score == null ? 'DNF' : fmt(it.row.score); timeCls = 'time'; }
+        if (ph === 'done' || ph === 'dnf') { time = state.race.showdown ? fmt(r.best) : it.row.score == null ? 'DNF' : fmt(it.row.score); timeCls = 'time'; }
         else if (ph === 'run1' || ph === 'run2') {
           const p = r.phases.find((x) => x.phase === ph), run = r.runs[ph === 'run1' ? 0 : 1];
           time = fmt(t >= run.at ? (run.time != null ? run.time : run.at - p.t) : t - p.t);
@@ -756,7 +962,7 @@
       const you = it.id === settings.playerTeam ? '<span class="you">YOU</span>' : '';
       return `<div class="row${it.id === state.focus ? ' focus' : ''}${outFlag ? ' out' : ''}" data-id="${it.id}">
         <div class="bar" style="background:${tm.color}"></div>
-        <div><div class="name">${esc(tm.name)} ${you}<span class="pill ${ph}">${PHASE_LABEL[ph]}</span></div><div class="sub">${sub}</div></div>
+        <div><div class="name">${esc(nameOf(it.id))} ${you}<span class="pill ${ph}">${PHASE_LABEL[ph]}</span></div><div class="sub">${sub}</div></div>
         <div class="right"><span class="${timeCls}">${time || '&nbsp;'}</span>${win ? '<span class="win">✔ ADV</span>' : ''}</div></div>`;
     };
     if (!state.race && !state.setup) { box.innerHTML = ''; return; }
@@ -764,7 +970,11 @@
       box.innerHTML = '<div class="empty">Eight teams are in the paddock. Start a championship to draw the heats.</div>' + items.map((it) => rowHtml(it)).join('');
       return;
     }
-    if (!heats) { box.innerHTML = items.map((it) => rowHtml(it)).join(''); return; }
+    if (!heats || (state.race && state.race.showdown)) {
+      const list = state.race && state.race.showdown ? state.race.ranking.map((id) => items.find((x) => x.id === id)) : items;
+      box.innerHTML = list.map((it) => rowHtml(it)).join('');
+      return;
+    }
     const byId = Object.fromEntries(items.map((x) => [x.id, x]));
     const decided = state.race ? Object.fromEntries((state.champ.rounds[state.roundIdx] || { heats: [] }).heats.map((h) => [h.a, h])) : {};
     box.innerHTML = heats.map((h, i) => {
@@ -794,11 +1004,11 @@
     const P = S.PARTS;
     const live = r ? `
       <div><span class="muted">Cells mapped</span><b>${countSeen(r, state.t)}</b></div>
-      <div><span class="muted">Route</span><b>${state.t >= r.exploreTime && r.route ? r.route.length - 1 + ' cells' : '…'}</b></div>
+      <div><span class="muted">Route</span><b>${(state.t >= r.exploreTime || state.race.showdown) && r.route ? r.route.length - 1 + ' cells' : '…'}</b></div>
       <div><span class="muted">Slides</span><b>${r.marks.filter((k) => k.type === 'slip' && k.t <= state.t).length}</b></div>
       <div><span class="muted">Battery used</span><b>${state.t >= r.endT ? Math.round(r.energyUsed * 100) + '%' : '…'}</b></div>` : '';
     card.innerHTML = `
-      <div class="spec-title"><canvas id="specMouse"></canvas><div><div class="t" style="color:${tm.color}">${esc(tm.name)}</div><div class="bio">${esc(tm.bio)}</div></div>
+      <div class="spec-title"><canvas id="specMouse"></canvas><div><div class="t" style="color:${tm.color}">${esc(nameOf(id))}</div><div class="bio">${esc(tm.bio)}</div></div>
       <button class="icon-btn" id="specClose" style="margin-left:auto;width:30px;height:30px" aria-label="Close">✕</button></div>
       <div class="spec-grid">
         <div><span class="muted">Motor</span><b>${P.motor[b.motor].name}</b></div>
@@ -814,10 +1024,72 @@
         <div><span class="muted">Mass</span><b>${st.massG} g</b></div>
         <div><span class="muted">Top / corner</span><b>${st.vmax.toFixed(2)} / ${st.cornerSpeed.toFixed(2)} m/s</b></div>
         ${live}
-      </div>`;
+      </div>
+      <div class="chart-head"><span>Speed trace · best run</span><span id="chartLegend"></span></div>
+      <canvas id="specChart" class="chart"></canvas>`;
     card.classList.remove('hidden');
     mousePreview($('specMouse'), id, b);
+    drawSpeedChart(id, r);
     $('specClose').onclick = () => { state.focus = null; towerKey = ''; };
+  }
+
+  // Speed vs distance for the focused mouse's best completed run, with its heat
+  // rival (or the round winner) as a dashed ghost.
+  function bestTrace(res) {
+    if (!res) return null;
+    const done = res.runs.filter((x) => x.time != null && state.t >= x.at);
+    if (!done.length) return null;
+    return done.reduce((a, b) => (b.time < a.time ? b : a));
+  }
+  function rivalOf(id) {
+    const heats = state.setup && state.setup.heats ? state.setup.heats : [];
+    for (const h of heats) {
+      const [a, b] = Array.isArray(h) ? h : [h.a, h.b];
+      if (a === id) return b;
+      if (b === id) return a;
+    }
+    const rows = state.race ? state.race.rows.filter((x) => x.id !== id && x.result.best != null) : [];
+    return rows.length ? rows.reduce((p, q) => (q.result.best < p.result.best ? q : p)).id : null;
+  }
+  function drawSpeedChart(id, res) {
+    const cv = $('specChart');
+    if (!cv) return;
+    const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 300, h = 130;
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    const g = cv.getContext('2d');
+    g.scale(dpr, dpr);
+    const mine = bestTrace(res);
+    const rid = rivalOf(id);
+    const rrow = rid && state.race ? state.race.rows.find((x) => x.id === rid) : null;
+    const theirs = rrow ? bestTrace(rrow.result) : null;
+    const traces = [[mine, team(id).color, []], [theirs, rid ? team(rid).color : '#fff', [4, 4]]].filter((x) => x[0]);
+    const pad = { l: 30, r: 8, t: 8, b: 18 };
+    g.font = '10px "JetBrains Mono", monospace'; g.fillStyle = '#5d7193'; g.strokeStyle = '#ffffff10';
+    if (!traces.length) {
+      g.textAlign = 'center';
+      g.fillText('No completed speed run yet', w / 2, h / 2);
+      $('chartLegend').textContent = '';
+      return;
+    }
+    const maxD = Math.max(...traces.map(([t]) => t.profile[t.profile.length - 1][0]));
+    const maxV = Math.max(1, ...traces.map(([t]) => t.peak)) * 1.1;
+    const X = (d) => pad.l + (d / maxD) * (w - pad.l - pad.r), Y = (v) => h - pad.b - (v / maxV) * (h - pad.t - pad.b);
+    g.lineWidth = 1;
+    for (let v = 0; v <= maxV; v += 1) {
+      g.beginPath(); g.moveTo(pad.l, Y(v)); g.lineTo(w - pad.r, Y(v)); g.stroke();
+      g.textAlign = 'right'; g.fillText(v.toFixed(0), pad.l - 5, Y(v) + 3);
+    }
+    g.textAlign = 'center';
+    for (let d = 0; d <= maxD; d += 1) g.fillText(d + 'm', X(d), h - 4);
+    for (const [t, color, dash] of [...traces].reverse()) {
+      g.save(); g.strokeStyle = color; g.lineWidth = dash.length ? 1.5 : 2.2; g.setLineDash(dash);
+      if (!dash.length) { g.shadowColor = color; g.shadowBlur = 6; }
+      g.beginPath();
+      t.profile.forEach(([d, v], i) => (i ? g.lineTo(X(d), Y(v)) : g.moveTo(X(d), Y(v))));
+      g.stroke(); g.restore();
+    }
+    $('chartLegend').innerHTML = `<b style="color:${team(id).color}">${mine ? secs(mine.time) : '—'}</b>` +
+      (theirs ? ` vs <b style="color:${team(rid).color}">${esc(team(rid).short)} ${secs(theirs.time)}</b>` : '') + ' · m/s';
   }
 
   // ------------------------------------------------------------ garage
@@ -847,6 +1119,7 @@
     box.innerHTML = `
       ${locked ? `<div class="lockbar">🔒 <span><b>Homologated.</b> Builds are locked for the rest of this championship. Click any mouse in Live timing to inspect its spec.</span></div>` : ''}
       <h4 style="margin-top:0">Your team</h4>
+      <label class="namefield"><span>Team name</span><input id="teamName" maxlength="24" placeholder="${esc(team(settings.playerTeam).name)}" value="${esc(settings.teamName)}" ${dis}></label>
       <div class="team-pick">${S.TEAMS.map((t) => `<button class="team-btn${t.id === settings.playerTeam ? ' on' : ''}" style="--tc:${t.color}" data-team="${t.id}" ${dis} title="${esc(t.bio)}"><canvas data-prev="${t.id}"></canvas>${t.short}</button>`).join('')}</div>
       <h4>Hardware</h4>
       <div class="parts">${PART_ROWS.map(optRow).join('')}</div>
@@ -914,6 +1187,7 @@
     }
   });
   $('tab-garage').addEventListener('input', (e) => {
+    if (e.target.id === 'teamName') { settings.teamName = e.target.value.trim().slice(0, 24); saveSettings(); towerKey = ''; renderBracket(); return; }
     if (e.target.id === 'agg') { $('aggVal').textContent = e.target.value + '%'; settings.build.aggression = +e.target.value / 100; }
     if (e.target.id === 'ss') { $('ssVal').textContent = e.target.value + '%'; settings.build.searchSpeed = +e.target.value / 100; }
   });
@@ -927,7 +1201,7 @@
     const c = state.champ;
     if (!c) {
       box.innerHTML = `<p class="muted">Start a championship to draw the bracket. Eight teams, three rounds, a new maze every round.</p>
-        <h4>The field</h4>${S.TEAMS.map((t) => `<div class="row" data-id="${t.id}" style="cursor:default"><div class="bar" style="background:${t.color}"></div><div><div class="name">${esc(t.name)}</div><div class="sub">${esc(t.bio)}</div></div><div></div></div>`).join('')}`;
+        <h4>The field</h4>${S.TEAMS.map((t) => `<div class="row" data-id="${t.id}" style="cursor:default"><div class="bar" style="background:${t.color}"></div><div><div class="name">${esc(nameOf(t.id))}</div><div class="sub">${esc(t.bio)}</div></div><div></div></div>`).join('')}`;
       return;
     }
     const shown = state.revealed ? state.roundIdx + 1 : state.roundIdx;
@@ -942,7 +1216,7 @@
       const decided = i < shown;
       const cls = decided ? (winner === id ? 'win' : 'lose') : '';
       const tm = team(id);
-      return `<div class="slot ${cls}"><span class="nm"><span class="dot" style="background:${tm.color}"></span>${esc(tm.name)}${id === c.playerTeam ? ' <span class="you">YOU</span>' : ''}</span><span class="sc">${score(i, id)}</span></div>`;
+      return `<div class="slot ${cls}"><span class="nm"><span class="dot" style="background:${tm.color}"></span>${esc(nameOf(id))}${id === c.playerTeam ? ' <span class="you">YOU</span>' : ''}</span><span class="sc">${score(i, id)}</span></div>`;
     };
     const fieldFor = (i) => {
       if (i === 0) return c.draw;
@@ -960,7 +1234,7 @@
     };
     const champ = c.champion && shown >= 3 ? team(c.champion) : null;
     box.innerHTML = `<div class="bracket">${col(0)}${col(1)}${col(2)}
-      <div class="bcol"><h5>Champion</h5><div class="trophy"><div class="cup">🏆</div><div class="who" style="color:${champ ? champ.color : 'var(--dim)'}">${champ ? esc(champ.name) : 'TBD'}</div></div></div></div>
+      <div class="bcol"><h5>Champion</h5><div class="trophy"><div class="cup">🏆</div><div class="who" style="color:${champ ? champ.color : 'var(--dim)'}">${champ ? esc(nameOf(c.champion)) : 'TBD'}</div></div></div></div>
       <p class="muted small" style="margin-top:12px">Seed ${hex(c.seed)} · ${c.advanced ? 'Advanced' : 'Standard'} · ${esc(S.SCORING[c.scoring].name)}. Scores are seconds; lower wins.</p>`;
   }
 
@@ -972,21 +1246,29 @@
     const titles = {};
     for (const h of hist) titles[h.champion] = (titles[h.champion] || 0) + 1;
     const mine = hist.filter((h) => h.reached === 'Champion').length;
-    box.innerHTML = `
-      <h4 style="margin-top:0">Fastest speed runs</h4>
+    const season = loadSeason();
+    const table = seasonTable(season.events);
+    const seasonHtml = `
+      <h4 style="margin-top:0">Season ${season.no} · championship ${Math.min(SEASON_LEN, season.events.length + 1)} of ${SEASON_LEN}</h4>
+      <table class="rec"><tr><th>#</th><th>Team</th><th style="text-align:right">Wins</th><th style="text-align:right">Pts</th></tr>
+      ${table.map((r, i) => `<tr class="${r.id === settings.playerTeam ? 'mine' : ''}"><td>${i + 1}</td><td><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${team(r.id).color};margin-right:6px"></span>${esc(nameOf(r.id))}</td><td class="num">${r.wins}</td><td class="num">${r.pts}</td></tr>`).join('')}</table>
+      <p class="muted small">Points: champion ${POINTS.champion} · finalist ${POINTS.final} · semi-finalist ${POINTS.semi} · quarter-finalist ${POINTS.quarter} · +${POINTS.fastest} for the championship's fastest run.</p>
+      ${season.champions.length ? `<p class="small">Past season champions: ${season.champions.slice(0, 6).map((c) => `<b style="color:${team(c.team).color}">S${c.no} ${esc(nameOf(c.team))}</b>`).join(' · ')}</p>` : ''}`;
+    box.innerHTML = seasonHtml + `
+      <h4>Fastest speed runs</h4>
       ${rec.length ? `<table class="rec"><tr><th>#</th><th>Team</th><th>Maze</th><th style="text-align:right">Time</th></tr>
-        ${rec.slice(0, 10).map((r, i) => `<tr class="${r.mine ? 'mine' : ''}"><td>${i + 1}</td><td>${esc(team(r.team) ? team(r.team).name : r.team)}${r.mine ? ' ★' : ''}</td><td class="muted">${esc(r.style)}${r.adv ? ' · adv' : ''}</td><td class="num">${fmt(r.time)}</td></tr>`).join('')}</table>` : '<div class="empty">No records yet. Finish a round to set some.</div>'}
+        ${rec.slice(0, 10).map((r, i) => `<tr class="${r.mine ? 'mine' : ''}"><td>${i + 1}</td><td>${esc(nameOf(r.team))}${r.mine ? ' ★' : ''}</td><td class="muted">${esc(r.style)}${r.adv ? ' · adv' : ''}</td><td class="num">${fmt(r.time)}</td></tr>`).join('')}</table>` : '<div class="empty">No records yet. Finish a round to set some.</div>'}
       <h4>Championship titles</h4>
-      ${hist.length ? `<div class="titles">${S.TEAMS.map((t) => `<div><span><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${t.color};margin-right:6px"></span>${esc(t.name)}</span><b>${titles[t.id] || 0}</b></div>`).join('')}</div>
+      ${hist.length ? `<div class="titles">${S.TEAMS.map((t) => `<div><span><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${t.color};margin-right:6px"></span>${esc(nameOf(t.id))}</span><b>${titles[t.id] || 0}</b></div>`).join('')}</div>
         <p class="muted small">You've won ${mine} of ${hist.length} championship${hist.length === 1 ? '' : 's'}.</p>
-        <h4>Recent seasons</h4>
+        <h4>Recent championships</h4>
         <table class="rec"><tr><th>Seed</th><th>Champion</th><th>You</th><th></th></tr>
-        ${hist.slice(0, 6).map((h) => `<tr><td class="muted">${h.seed}</td><td>${esc(team(h.champion).name)}</td><td>${esc(team(h.player).short)} · ${esc(h.reached)}</td><td><button class="btn" data-seed="${h.seed}" style="padding:3px 8px;font-size:10px">Re-run</button></td></tr>`).join('')}</table>` : '<div class="empty">No completed championships yet.</div>'}
+        ${hist.slice(0, 6).map((h) => `<tr><td class="muted">${h.seed}</td><td>${esc(nameOf(h.champion))}</td><td>${esc(team(h.player).short)} · ${esc(h.reached)}</td><td><button class="btn" data-seed="${h.seed}" style="padding:3px 8px;font-size:10px">Re-run</button></td></tr>`).join('')}</table>` : '<div class="empty">No completed championships yet.</div>'}
       <div class="btn-row"><button class="btn" id="clearRec">Clear records</button></div>`;
   }
   $('tab-records').addEventListener('click', (e) => {
-    if (e.target.id === 'clearRec' && confirm('Clear local records and championship history?')) {
-      store.set(KEYS.records, []); store.set(KEYS.history, []); renderRecords();
+    if (e.target.id === 'clearRec' && confirm('Clear local records, championship history and season standings?')) {
+      store.set(KEYS.records, []); store.set(KEYS.history, []); store.set(KEYS.season, null); renderRecords();
     }
     const seed = e.target.dataset && e.target.dataset.seed;
     if (seed) {
@@ -1012,14 +1294,24 @@
           slip: 'slid wide while searching',
           flat: 'battery went flat, limping on',
         }[k.type];
-        items.push([k.t, `<span style="color:${tm.color}">${esc(tm.name)}</span> ${msg}`]);
+        items.push([k.t, `<span style="color:${tm.color}">${esc(nameOf(row.id))}</span> ${msg}`]);
       }
-      for (const p of r.phases) if (p.phase === 'return' && p.t <= state.t) items.push([p.t, `<span style="color:${tm.color}">${esc(tm.name)}</span> heading home`]);
+      for (const p of r.phases) if (p.phase === 'return' && p.t <= state.t) items.push([p.t, `<span style="color:${tm.color}">${esc(nameOf(row.id))}</span> heading home`]);
     }
     if (items.length === logCount) return;
     logCount = items.length;
     items.sort((a, b) => b[0] - a[0]);
+    if (items.length && state.playing) ticker(items[0][1]);
     $('log').innerHTML = items.map(([t, m]) => `<div><span class="lt">${t.toFixed(2)}s</span><span>${m}</span></div>`).join('') || '<div class="empty" style="display:block">Lights out…</div>';
+  }
+
+  let tickerTimer = 0;
+  function ticker(html) {
+    const el = $('ticker');
+    el.innerHTML = html;
+    el.classList.add('show');
+    clearTimeout(tickerTimer);
+    tickerTimer = setTimeout(() => el.classList.remove('show'), 2600);
   }
 
   // ------------------------------------------------------------ tabs + controls
@@ -1040,15 +1332,19 @@
   $('newBtn').onclick = () => { if (state.mode === 'champion' || confirm('Abandon this championship?')) newChampionship(); };
   $('playBtn').onclick = () => {
     if (!state.race) return;
+    if (state.countdown) { state.countdown = null; state.playing = true; syncControls(); return; }
     if (state.t >= endOf()) state.t = 0;
     state.playing = !state.playing;
     syncControls();
   };
-  $('restartBtn').onclick = () => { state.t = 0; state.playing = true; syncControls(); };
-  $('skipBtn').onclick = () => { state.t = endOf(); state.playing = false; onRaceEnd(); syncControls(); };
+  $('restartBtn').onclick = () => { state.t = 0; startCountdown(); syncControls(); };
+  $('skipBtn').onclick = () => { state.countdown = null; state.t = endOf(); state.playing = false; onRaceEnd(); syncControls(); };
+  $('showdownBtn').onclick = toggleShowdown;
+  $('soundBtn').onclick = () => { settings.sound = !settings.sound; saveSettings(); if (settings.sound) sfx.goal(); syncControls(); };
   $('scrub').addEventListener('input', (e) => {
     if (!state.race) return;
     state.t = (+e.target.value / 1000) * endOf();
+    state.countdown = null;
     if (state.t >= endOf() - 1e-6) onRaceEnd();
   });
 
@@ -1113,6 +1409,7 @@
     else if (e.key === 'End' && state.race) $('skipBtn').click();
     else if (/^[1-7]$/.test(e.key)) { settings.speed = [0.5, 1, 2, 4, 8, 16, 32][+e.key - 1]; saveSettings(); syncControls(); }
     else if (e.key === 'f' || e.key === 'F') $('toggles').querySelector('[data-view=fog]').click();
+    else if (e.key === 'm' || e.key === 'M') $('soundBtn').click();
   });
 
   // ------------------------------------------------------------ boot
