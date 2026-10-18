@@ -30,6 +30,7 @@
         <span>Scoring</span>
         <select id="scoring"></select>
       </label>
+      <button class="icon-btn" id="soundBtn" title="Sound on/off (M)" aria-label="Mute sound">🔊</button>
       <button class="chip" id="shareBtn" title="Copy a link to this championship and your build">
         <span id="seedLabel">SEED —</span> <span aria-hidden="true">⧉</span>
       </button>
@@ -48,6 +49,7 @@
 
       <div class="arena-wrap" id="arenaWrap">
         <canvas id="arena" aria-label="Race arena"></canvas>
+        <div class="ticker" id="ticker" aria-live="polite"></div>
         <div class="banner hidden" id="banner"></div>
       </div>
 
@@ -65,6 +67,7 @@
 
       <div class="cta-row">
         <button class="cta" id="cta">Start championship</button>
+        <button class="ghost-btn" id="showdownBtn" title="Replay every mouse's best speed run side by side" disabled>⚡ Speed-run showdown</button>
         <button class="ghost-btn" id="practiceBtn" title="Run your current build alone on a fresh maze">Test lap</button>
         <button class="ghost-btn" id="newBtn" title="Abandon this championship and return to the garage">New championship</button>
         <p class="status" id="status"></p>
@@ -97,7 +100,7 @@
 
   <footer class="foot">
     <span>Simulated physics with deterministic seeds. Times are virtual; six decimal places are not six places of physical accuracy.</span>
-    <span>Engine <b id="engineVersion"></b> · <a href="https://github.com/DWestbury-PP/MicroMouse-Elimination" target="_blank" rel="noopener">source</a> · keys: Space play · ←/→ scrub · 1–7 speed · F fog</span>
+    <span>Engine <b id="engineVersion"></b> · <a href="https://github.com/DWestbury-PP/MicroMouse-Elimination" target="_blank" rel="noopener">source</a> · keys: Space play · ←/→ scrub · 1–7 speed · F map · M sound</span>
   </footer>
 
   <script src="js/sim.js"></script>

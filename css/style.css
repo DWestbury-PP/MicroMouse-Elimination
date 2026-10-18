@@ -143,6 +143,14 @@ h2 { margin: 2px 0 0; font: 700 22px/1.15 var(--display); letter-spacing: 0.03em
 .ghost-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .status { margin: 0; color: var(--muted); font-size: 13px; flex-basis: 100%; }
 
+.ticker {
+  position: absolute; top: 12px; left: 12px; max-width: calc(100% - 24px); padding: 7px 12px; border-radius: 9px;
+  background: #0a1222e0; border: 1px solid var(--line2); font: 600 12.5px var(--display); letter-spacing: 0.03em;
+  opacity: 0; transform: translateY(-6px); transition: opacity 0.25s, transform 0.25s; pointer-events: none;
+}
+.ticker.show { opacity: 1; transform: none; }
+.ticker b { font-family: var(--mono); }
+
 /* ---------------------------------------------------------------- tower */
 .heat { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; overflow: hidden; }
 .heat-label { display: flex; justify-content: space-between; font: 600 10px var(--display); letter-spacing: 0.14em; color: var(--dim); padding: 5px 10px; background: #0a1120; text-transform: uppercase; }
@@ -178,6 +186,10 @@ h2 { margin: 2px 0 0; font: 700 22px/1.15 var(--display); letter-spacing: 0.03em
 .spec-title .t { font: 700 16px var(--display); }
 .spec-title .bio { color: var(--muted); font-size: 12px; }
 
+.chart-head { display: flex; justify-content: space-between; margin: 12px 0 4px; font: 600 10px var(--display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); }
+.chart-head b { font-family: var(--mono); letter-spacing: 0; }
+.chart { display: block; width: 100%; height: 130px; background: #0a1120; border: 1px solid var(--line); border-radius: 10px; }
+
 /* ---------------------------------------------------------------- tabs */
 .tabs { display: flex; gap: 4px; margin-top: 14px; border-bottom: 1px solid var(--line); }
 .tabs button {
@@ -188,6 +200,9 @@ h2 { margin: 2px 0 0; font: 700 22px/1.15 var(--display); letter-spacing: 0.03em
 .tabs + .card { margin-top: 0; border-top-left-radius: 0; border-top-right-radius: 0; border-top: 0; }
 
 /* ---------------------------------------------------------------- garage */
+.namefield { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font: 600 11px var(--display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.namefield input { flex: 1; min-width: 0; background: var(--bg2); border: 1px solid var(--line2); border-radius: 8px; padding: 7px 10px; font: 600 13px var(--display); letter-spacing: 0.02em; text-transform: none; }
+.namefield input:focus { outline: none; border-color: var(--accent); }
 .lockbar { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-radius: 10px; background: #ffc85712; border: 1px solid #ffc85744; color: var(--accent2); font-size: 13px; margin-bottom: 12px; }
 .team-pick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
 .team-btn {

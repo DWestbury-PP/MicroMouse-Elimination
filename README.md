@@ -35,6 +35,10 @@ Corner speed is `min(grip √(μ·N/m·r), yaw k·√(F/m))`, so heavy fan build
 
 Builds lock (homologate) when a championship starts.
 
+## Seasons
+
+Five championships make a season. Points: champion 10, finalist 6, semi-finalist 3, quarter-finalist 1, plus 1 for the championship's fastest single speed run. Standings and past season champions are in **Records**. You can rename your team in the garage.
+
 ## Replay and views
 
 Races are fully simulated up front by a deterministic engine, then replayed on a virtual clock. You can pause, scrub, and play at 0.5×–32×, and frame rate never affects results. You can toggle:
@@ -45,7 +49,7 @@ Races are fully simulated up front by a deterministic engine, then replayed on a
 - flood-fill values
 - the true shortest path
 
-Click a mouse to see its spec sheet.
+Click a mouse to see its spec sheet and a **speed trace** of its best run, overlaid with its heat rival's. After a round, **Speed-run showdown** replays every mouse's best run side by side from a standing start. Races open with start lights, and synthesized sound effects can be muted with **M**.
 
 Use **Seed** to copy a link that reproduces the championship and carries your build.
 

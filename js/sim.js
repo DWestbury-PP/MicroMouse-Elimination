@@ -13,7 +13,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const ENGINE_VERSION = '2.0.0';
+  const ENGINE_VERSION = '2.1.0';
 
   // ---------------------------------------------------------------- geometry
   const N = 16;
@@ -644,6 +644,10 @@
       const finishT = t0 + tn[K - 1];
       let peak = 0;
       for (let k = 0; k <= K; k++) peak = Math.max(peak, vel[k]);
+      // Speed trace for telemetry: [distance m, speed m/s, time s] at each half-cell node.
+      const lastNode = crashAt >= 0 ? 2 * crashAt : K - 1;
+      const profile = [];
+      for (let k = 0, dist = 0; k <= lastNode; dist += ds[k] || 0, k++) profile.push([round(dist, 4), round(vel[k], 3), round(tn[k], 4)]);
       let res;
       if (crashAt >= 0) {
         const tc = t0 + tn[2 * crashAt];
@@ -651,13 +655,13 @@
         t = tc + 0.8;
         drain(t - t0, 1);
         pos = path[crashAt];
-        res = { n, time: null, crashed: true, aggression, at: tc, peak };
+        res = { n, time: null, crashed: true, aggression, at: tc, start: t0, peak, profile };
       } else {
         marks.push({ t: finishT, type: 'finish', c: path[L], run: n });
         t = t0 + tn[K];
         drain(t - t0, 1);
         pos = path[L]; heading = hd[L - 1];
-        res = { n, time: tn[K - 1], crashed: false, sag: s, aggression, at: finishT, peak };
+        res = { n, time: tn[K - 1], crashed: false, sag: s, aggression, at: finishT, start: t0, peak, profile };
       }
       return res;
     }
