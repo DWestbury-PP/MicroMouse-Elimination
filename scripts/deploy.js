@@ -55,10 +55,16 @@ async function main() {
     return j;
   };
 
-  const files = Object.entries(FILES).map(([p, contentType]) => ({ path: p, size: fs.statSync(p).size, contentType }));
+  // here.now caches assets for an hour (and serves stale for a day), so stamp
+  // the release into the asset URLs: a new index.html never pairs with old JS.
+  const sha = allowDirty ? 'dev' + Date.now().toString(36) : sh('git rev-parse --short HEAD');
+  const bodies = {};
+  for (const p of Object.keys(FILES)) bodies[p] = fs.readFileSync(p);
+  bodies['index.html'] = Buffer.from(bodies['index.html'].toString('utf8').replace(/((?:src|href)="(?:js|css)\/[\w.-]+\.(?:js|css))"/g, `$1?v=${sha}"`));
+  const files = Object.entries(FILES).map(([p, contentType]) => ({ path: p, size: bodies[p].length, contentType }));
   const { upload } = await api('PUT', '/api/v1/publish/' + slug, { files });
   for (const u of upload.uploads) {
-    const r = await fetch(u.url, { method: u.method || 'PUT', headers: u.headers, body: fs.readFileSync(u.path) });
+    const r = await fetch(u.url, { method: u.method || 'PUT', headers: u.headers, body: bodies[u.path] });
     if (!r.ok) die(`upload ${u.path} -> HTTP ${r.status}`);
     console.log('  uploaded ' + u.path);
   }
@@ -75,8 +81,8 @@ async function main() {
   }
   const page = await (await fetch(base + bust)).text();
   if (!page.includes('<title>MicroMouse Grand Prix</title>')) die('live index.html looks wrong');
+  if (!page.includes(`js/app.js?v=${sha}"`)) die('live index.html is missing the release stamp');
 
-  const sha = allowDirty ? 'working tree' : sh('git rev-parse --short HEAD');
   console.log(`deployed ${sha} -> ${base} (version ${fin.currentVersionId}, previous ${fin.previousVersionId})`);
 }
 
