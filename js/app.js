@@ -242,6 +242,29 @@
   }
 
   // ------------------------------------------------------------ replay maths
+  // Position along a move at time t. Diagonal speed-run moves carry waypoints
+  // (cell units) through the edge midpoint, timed by `tm`; others go centre to centre.
+  const px = (v) => MARGIN + v * CS;
+  const diagNote = (run) => (run && run.diagonals ? ` · ${run.diagonals} diagonal${run.diagonals > 1 ? 's' : ''}` : '');
+  function movePoint(m, t) {
+    if (!m.pts) {
+      const f = Math.min(1, Math.max(0, (t - m.t0) / Math.max(1e-9, m.t1 - m.t0)));
+      return [cx(m.from) + (cx(m.to) - cx(m.from)) * f, cy(m.from) + (cy(m.to) - cy(m.from)) * f];
+    }
+    const [a, b, c] = m.pts;
+    const [p, q, ta, tb] = t < m.tm ? [a, b, m.t0, m.tm] : [b, c, m.tm, m.t1];
+    const f = Math.min(1, Math.max(0, (t - ta) / Math.max(1e-9, tb - ta)));
+    return [px(p[0] + (q[0] - p[0]) * f), px(p[1] + (q[1] - p[1]) * f)];
+  }
+  // Polyline of a move up to time t, for trails.
+  function traceMove(m, t, ox, oy, start) {
+    const pts = m.pts ? [[px(m.pts[0][0]), px(m.pts[0][1])], ...(t >= m.tm ? [[px(m.pts[1][0]), px(m.pts[1][1])]] : [])] : [[cx(m.from), cy(m.from)]];
+    if (start) ctx.moveTo(pts[0][0] + ox, pts[0][1] + oy);
+    for (const [x, y] of pts.slice(start ? 1 : 0)) ctx.lineTo(x + ox, y + oy);
+    const [x, y] = movePoint(m, t);
+    ctx.lineTo(x + ox, y + oy);
+  }
+
   function poseAt(res, t) {
     const mv = res.moves;
     const startPose = { c: S.START, x: cx(S.START), y: cy(S.START), a: 0, fade: 1, moving: false };
@@ -254,20 +277,23 @@
       const c = f < 0.5 ? m.from : m.to;
       return { c, x: cx(c), y: cy(c), a: 0, fade: Math.abs(f - 0.5) * 2, moving: false, idx: lo };
     }
-    const prevH = lo > 0 && mv[lo - 1].kind !== 'reset' ? mv[lo - 1].h : m.h;
-    const a0 = prevH * 90, d = ((m.h * 90 - a0 + 540) % 360) - 180;
-    const a = (a0 + d * Math.min(1, f / 0.35)) * Math.PI / 180;
-    let ang = a;
+    let ang;
+    if (m.pts) {
+      // Face along the line actually driven, smoothed across the waypoint.
+      const dt = (m.t1 - m.t0) * 0.2;
+      const [x0, y0] = movePoint(m, Math.max(m.t0, t - dt)), [x1, y1] = movePoint(m, Math.min(m.t1, t + dt));
+      ang = Math.atan2(x1 - x0, y0 - y1);
+    } else {
+      const prevH = lo > 0 && mv[lo - 1].kind !== 'reset' ? mv[lo - 1].h : m.h;
+      const a0 = prevH * 90, d = ((m.h * 90 - a0 + 540) % 360) - 180;
+      ang = (a0 + d * Math.min(1, f / 0.35)) * Math.PI / 180;
+    }
     for (const k of res.marks) {
       if (k.type === 'crash' && t >= k.t && t < k.t + 0.8) ang += (t - k.t) * 14;
       if (k.type === 'slip' && t >= k.t && t < k.t + 0.6) ang += Math.sin((t - k.t) * 40) * 0.35;
     }
-    return {
-      c: f < 1 ? m.from : m.to,
-      x: cx(m.from) + (cx(m.to) - cx(m.from)) * f,
-      y: cy(m.from) + (cy(m.to) - cy(m.from)) * f,
-      a: ang, fade: 1, moving: t < m.t1, idx: lo, ph: m.ph,
-    };
+    const [x, y] = movePoint(m, t);
+    return { c: f < 1 ? m.from : m.to, x, y, a: ang, fade: 1, moving: t < m.t1, idx: lo, ph: m.ph, diag: !!m.pts };
   }
 
   function phaseAt(res, t) {
@@ -428,9 +454,8 @@
     for (const m of mv) {
       if (m.t0 > t) break;
       if (isRun(m.ph) || m.kind === 'reset' || m.ph === 'reset') { open = false; continue; }
-      const f = Math.min(1, (t - m.t0) / Math.max(1e-9, m.t1 - m.t0));
-      if (!open) { ctx.moveTo(cx(m.from) + ox, cy(m.from) + oy); open = true; }
-      ctx.lineTo(cx(m.from) + (cx(m.to) - cx(m.from)) * f + ox, cy(m.from) + (cy(m.to) - cy(m.from)) * f + oy);
+      traceMove(m, t, ox, oy, !open);
+      open = true;
     }
     ctx.stroke();
     // current speed run, bright
@@ -442,9 +467,8 @@
       for (const m of mv) {
         if (m.t0 > t) break;
         if (m.ph !== curRun) continue;
-        const f = Math.min(1, (t - m.t0) / Math.max(1e-9, m.t1 - m.t0));
-        if (first) { ctx.moveTo(cx(m.from) + ox, cy(m.from) + oy); first = false; }
-        ctx.lineTo(cx(m.from) + (cx(m.to) - cx(m.from)) * f + ox, cy(m.from) + (cy(m.to) - cy(m.from)) * f + oy);
+        traceMove(m, t, ox, oy, first);
+        first = false;
       }
       ctx.stroke();
     }
@@ -658,7 +682,7 @@
       const bi = r.best == null ? -1 : r.runs.findIndex((x) => x.time === r.best);
       if (bi < 0) return null;
       const run = r.runs[bi], ph = 'run' + run.n, off = run.start;
-      const moves = r.moves.filter((m) => m.ph === ph).map((m) => ({ ...m, t0: m.t0 - off, t1: m.t1 - off }));
+      const moves = r.moves.filter((m) => m.ph === ph).map((m) => ({ ...m, t0: m.t0 - off, t1: m.t1 - off, ...(m.tm != null && { tm: m.tm - off }) }));
       const marks = r.marks.filter((k) => k.type === 'finish' && k.run === run.n).map((k) => ({ ...k, t: k.t - off }));
       const runs = r.runs.map((x, i) => (i === bi ? { ...x, at: x.at - off, start: 0 } : { ...x, at: Infinity }));
       const endT = moves.length ? moves[moves.length - 1].t1 : 0;
@@ -1021,6 +1045,7 @@
         <div><span class="muted">Tie-break</span><b>${S.TIEBREAKS[b.tieBreak].name}</b></div>
         <div><span class="muted">Aggression</span><b>${Math.round(b.aggression * 100)}%</b></div>
         <div><span class="muted">Search pace</span><b>${Math.round(b.searchSpeed * 100)}%</b></div>
+        <div><span class="muted">Steering</span><b>${b.steering === 'diagonal' ? `45° · ${Math.round(b.diagPace * 100)}% pace` : '90° only'}</b></div>
         <div><span class="muted">Mass</span><b>${st.massG} g</b></div>
         <div><span class="muted">Top / corner</span><b>${st.vmax.toFixed(2)} / ${st.cornerSpeed.toFixed(2)} m/s</b></div>
         ${live}
@@ -1094,7 +1119,7 @@
 
   // ------------------------------------------------------------ garage
   const PART_ROWS = [
-    ['motor', 'Motor'], ['tires', 'Tires'], ['fan', 'Suction'], ['sensors', 'Sensors'], ['battery', 'Battery'],
+    ['motor', 'Motor'], ['tires', 'Tires'], ['fan', 'Suction'], ['sensors', 'Sensors'], ['battery', 'Battery'], ['steering', 'Steering'],
   ];
   const STRAT_ROWS = [['policy', 'Search policy'], ['planner', 'Speed-run planner'], ['tieBreak', 'Flood-fill tie-break']];
 
@@ -1116,6 +1141,7 @@
     const stat = (k, v, frac, note) => `<div class="stat"><span class="k">${k}</span><div class="meter"><i style="width:${Math.max(4, Math.min(100, frac * 100))}%"></i></div><span class="v">${v}</span></div>${note ? `<div class="muted small" style="margin:-4px 0 0 122px">${note}</div>` : ''}`;
     const tune = state.tune;
     const lap = state.lap;
+    const diag = b.steering === 'diagonal';
     box.innerHTML = `
       ${locked ? `<div class="lockbar">🔒 <span><b>Homologated.</b> Builds are locked for the rest of this championship. Click any mouse in Live timing to inspect its spec.</span></div>` : ''}
       <h4 style="margin-top:0">Your team</h4>
@@ -1133,6 +1159,9 @@
         <div class="slider"><label>Search pace <b id="ssVal">${Math.round(b.searchSpeed * 100)}%</b></label>
           <input type="range" id="ss" min="25" max="70" step="1" value="${Math.round(b.searchSpeed * 100)}" ${dis}>
           <div class="hint">Cruise speed while exploring, as a share of top speed. Faster searches save time but drain the battery and slide more.</div></div>
+        <div class="slider${diag ? '' : ' off'}"><label>Diagonal pace <b id="dpVal">${Math.round(b.diagPace * 100)}%</b></label>
+          <input type="range" id="dp" min="40" max="100" step="1" value="${Math.round(b.diagPace * 100)}" ${dis || (diag ? '' : 'disabled')}>
+          <div class="hint">${diag ? `How hard the attack run threads the posts on a diagonal, as a share of ${st.diagRef.toFixed(2)} m/s. Your ${esc(S.PARTS.sensors[b.sensors].name.replace(/ \(.*/, ''))} sensors are rated to about <b>${Math.round(st.diagSafe * 100)}%</b>; beyond that, clipping a post gets likely. IR glare lowers it. The first run stays within the rating.` : 'Fit 45° diagonal steering to cut zig-zags on a straight line during speed runs.'}</div></div>
       </div>
       <h4>Engineering readout</h4>
       <div class="stats">
@@ -1143,6 +1172,7 @@
         ${stat('Search cruise', st.searchCruise.toFixed(2) + ' m/s', st.searchCruise / 2)}
         ${stat('Endurance', (endurance / 60).toFixed(1) + ' min', endurance / 120, 'at search pace, before the battery sags')}
         ${stat('Sensor range', st.range + (st.range > 1 ? ' cells' : ' cell'), st.range / 4)}
+        ${diag ? stat('Diagonal speed', (b.diagPace * st.diagRef).toFixed(2) + ' m/s', (b.diagPace * st.diagRef) / 2.4, b.diagPace > st.diagSafe ? 'above the sensor rating: fast, but posts get clipped' : 'within the sensor rating') : ''}
       </div>
       <div class="formula">Corner speed = min( grip <code>√(μ·N/m·r)</code> = ${st.gripCorner.toFixed(2)}, yaw <code>k·√(F/m)</code> = ${st.yawCorner.toFixed(2)} ) m/s, with turn radius r = 9 cm. Suction raises N, the normal force, without adding much mass.</div>
       <div class="btn-row">
@@ -1152,7 +1182,7 @@
       </div>
       ${tune ? `<div class="lap">${tune}</div>` : ''}
       ${lap ? `<div class="lap"><b>Last test lap</b> · ${esc(lap.style)}<br>${lap.score == null ? 'DNF: ' + esc(lap.dnf) : `Score <b>${secs(lap.score)}</b> · best run <b>${secs(lap.best)}</b> · search <b>${secs(lap.explore, 2)}</b>`}<br>
-        Runs: ${lap.runs.map((r) => (r.crashed ? 'crash' : secs(r.time))).join(' / ')} · ${lap.cells} cells mapped · ${lap.slips} slides · battery ${Math.round(lap.energy * 100)}%</div>` : ''}`;
+        Runs: ${lap.runs.map((r) => (r.crashed ? (r.cause === 'diagonal' ? 'clipped a post' : 'crash') : secs(r.time) + diagNote(r))).join(' / ')} · ${lap.cells} cells mapped · ${lap.slips} slides · battery ${Math.round(lap.energy * 100)}%</div>` : ''}`;
     box.querySelectorAll('canvas[data-prev]').forEach((cv) => mousePreview(cv, cv.dataset.prev, cv.dataset.prev === settings.playerTeam ? settings.build : S.rivalBuild(cv.dataset.prev, state.nextSeed)));
   }
 
@@ -1190,9 +1220,10 @@
     if (e.target.id === 'teamName') { settings.teamName = e.target.value.trim().slice(0, 24); saveSettings(); towerKey = ''; renderBracket(); return; }
     if (e.target.id === 'agg') { $('aggVal').textContent = e.target.value + '%'; settings.build.aggression = +e.target.value / 100; }
     if (e.target.id === 'ss') { $('ssVal').textContent = e.target.value + '%'; settings.build.searchSpeed = +e.target.value / 100; }
+    if (e.target.id === 'dp') { $('dpVal').textContent = e.target.value + '%'; settings.build.diagPace = +e.target.value / 100; }
   });
   $('tab-garage').addEventListener('change', (e) => {
-    if (e.target.id === 'agg' || e.target.id === 'ss') setBuild({});
+    if (e.target.id === 'agg' || e.target.id === 'ss' || e.target.id === 'dp') setBuild({});
   });
 
   // ------------------------------------------------------------ bracket
@@ -1289,8 +1320,8 @@
         if (k.t > state.t) continue;
         const msg = {
           goal: 'reached the centre',
-          finish: `run ${k.run}: <b>${secs(r.runs[k.run - 1] && r.runs[k.run - 1].time)}</b>`,
-          crash: `crashed on run ${k.run}`,
+          finish: `run ${k.run}: <b>${secs(r.runs[k.run - 1] && r.runs[k.run - 1].time)}</b>${diagNote(r.runs[k.run - 1])}`,
+          crash: k.cause === 'diagonal' ? `clipped a post on a diagonal, run ${k.run}` : `crashed on run ${k.run}`,
           slip: 'slid wide while searching',
           flat: 'battery went flat, limping on',
         }[k.type];

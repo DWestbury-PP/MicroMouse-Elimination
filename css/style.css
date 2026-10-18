@@ -229,6 +229,8 @@ h2 { margin: 2px 0 0; font: 700 22px/1.15 var(--display); letter-spacing: 0.03em
 .slider label b { font: 700 12px var(--mono); color: var(--text); letter-spacing: 0; }
 .slider input { width: 100%; accent-color: var(--accent); }
 .slider .hint { color: var(--dim); font-size: 11px; }
+.slider.off { opacity: 0.55; }
+.slider .hint b { color: var(--text); }
 .stats { display: grid; gap: 7px; }
 .stat { display: grid; grid-template-columns: 112px 1fr 76px; gap: 10px; align-items: center; font-size: 12px; }
 .stat .k { color: var(--muted); }

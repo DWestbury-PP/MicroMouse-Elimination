@@ -13,13 +13,14 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
 
-  const ENGINE_VERSION = '2.1.0';
+  const ENGINE_VERSION = '2.2.0';
 
   // ---------------------------------------------------------------- geometry
   const N = 16;
   const CELL = 0.18;                    // m, regulation cell pitch
   const TURN_R = CELL / 2;              // smooth-turn radius
   const TURN_ARC = Math.PI * TURN_R / 2;
+  const DIAG_HALF = CELL / (2 * Math.SQRT2); // half a cell crossed on a 45° diagonal
   const G = 9.81;
   const DX = [0, 1, 0, -1];
   const DY = [-1, 0, 1, 0];             // N E S W; y grows downward (south)
@@ -222,7 +223,18 @@
       s2: { name: '2S 260 mAh', mass: 12, volt: 1.0, energy: 200, desc: 'Standard pack.' },
       s2xl: { name: '2S 450 mAh', mass: 19, volt: 1.04, energy: 340, desc: 'Runs all day. Heavy.' },
     },
+    steering: {
+      orthogonal: { name: '90° turns only', mass: 0, desc: 'Classic: every corner is a quarter-turn through the cell centre.' },
+      diagonal: { name: '45° diagonal steering', mass: 15, desc: 'Gyro and angled sensors let speed runs cut zig-zags on a straight diagonal. Extra weight.' },
+    },
   };
+  // 45° flicks onto and off a diagonal are tighter than a swept 90° corner.
+  // Threading the posts needs constant small steering corrections, so diagonal
+  // pace is a share of DIAG_REF x the yaw-limited corner speed (heavy chassis suffer),
+  // and how fast is safe depends on how well the sensors see the posts.
+  const TURN45 = { grip: 0.9, yaw: 0.9 };
+  const DIAG_REF = 2.1;
+  const DIAG_SAFE = { short: 0.64, mid: 0.6, long: 0.52 };
   const POLICIES = {
     dash: { name: 'Dash', budget: 0, desc: 'Goes home as soon as it finds the centre.' },
     balanced: { name: 'Balanced', budget: 60, desc: 'Checks promising shortcuts on the way home.' },
@@ -238,12 +250,13 @@
     left: { name: 'Left first', desc: 'Breaks ties toward the left.' },
     right: { name: 'Right first', desc: 'Breaks ties toward the right.' },
   };
-  const LIMITS = { aggression: [0.7, 1.1], searchSpeed: [0.25, 0.7] };
+  const LIMITS = { aggression: [0.7, 1.1], searchSpeed: [0.25, 0.7], diagPace: [0.4, 1] };
   const DEFAULT_BUILD = {
     motor: 'coreless', tires: 'urethane', fan: 'none', sensors: 'mid', battery: 's2',
-    policy: 'balanced', planner: 'cells', tieBreak: 'straight', aggression: 0.9, searchSpeed: 0.45,
+    policy: 'balanced', planner: 'cells', tieBreak: 'straight', steering: 'orthogonal',
+    aggression: 0.9, searchSpeed: 0.45, diagPace: 0.58,
   };
-  const CATALOG = { motor: PARTS.motor, tires: PARTS.tires, fan: PARTS.fan, sensors: PARTS.sensors, battery: PARTS.battery, policy: POLICIES, planner: PLANNERS, tieBreak: TIEBREAKS };
+  const CATALOG = { motor: PARTS.motor, tires: PARTS.tires, fan: PARTS.fan, sensors: PARTS.sensors, battery: PARTS.battery, policy: POLICIES, planner: PLANNERS, tieBreak: TIEBREAKS, steering: PARTS.steering };
 
   function normalizeBuild(b) {
     const out = {};
@@ -258,21 +271,24 @@
   function deriveStats(build) {
     const b = normalizeBuild(build);
     const M = PARTS.motor[b.motor], T = PARTS.tires[b.tires], F = PARTS.fan[b.fan];
-    const S = PARTS.sensors[b.sensors], B = PARTS.battery[b.battery];
-    const massG = CHASSIS_MASS + M.mass + T.mass + F.mass + S.mass + B.mass;
+    const S = PARTS.sensors[b.sensors], B = PARTS.battery[b.battery], D = PARTS.steering[b.steering];
+    const massG = CHASSIS_MASS + M.mass + T.mass + F.mass + S.mass + B.mass + D.mass;
     const m = massG / 1000;
     const normal = m * G + F.downforce;
     const vmax = M.topSpeed * B.volt * T.rolling;
     const motorAccel = (M.force * B.volt) / m;
     const tractionAccel = (T.grip * normal) / m;
+    const cornerSpeed = Math.min(Math.sqrt(tractionAccel * TURN_R), YAW_K * Math.sqrt(motorAccel));
     return {
       massG, m, normal, vmax, motorAccel, tractionAccel,
       accel: Math.min(motorAccel, tractionAccel),
       grip: T.grip, dustLoss: T.dustLoss, downforce: F.downforce,
       gripCorner: Math.sqrt(tractionAccel * TURN_R),
       yawCorner: YAW_K * Math.sqrt(motorAccel),
-      cornerSpeed: Math.min(Math.sqrt(tractionAccel * TURN_R), YAW_K * Math.sqrt(motorAccel)),
+      cornerSpeed,
       range: S.range, noise: S.noise,
+      diagonal: b.steering === 'diagonal', diagSafe: DIAG_SAFE[b.sensors], diagRef: Math.min(vmax, DIAG_REF * cornerSpeed),
+      corner45: Math.min(Math.sqrt(tractionAccel * TURN_R) * TURN45.grip, YAW_K * Math.sqrt(motorAccel) * TURN45.yaw),
       energy: B.energy, motorW: M.power, fanW: F.power,
       searchCruise: b.searchSpeed * vmax,
     };
@@ -282,28 +298,28 @@
   const TEAMS = [
     { id: 'redline', name: 'Redline Racing', short: 'RED', color: '#ff4d6d', shape: 'wedge', emblem: 'R',
       bio: 'Brushless power and late braking.',
-      bias: { motor: { brushless: 5, coreless: 1, geared: 0.3 }, fan: { none: 1, low: 3, high: 1 }, aggression: [0.93, 1.03] } },
+      bias: { motor: { brushless: 5, coreless: 1, geared: 0.3 }, fan: { none: 1, low: 3, high: 1 }, steering: { orthogonal: 2 }, aggression: [0.93, 1.03] } },
     { id: 'bluevector', name: 'Blue Vector', short: 'BLU', color: '#4cc9f0', shape: 'disc', emblem: 'V',
       bio: 'Long-range eyes and methodical searches.',
-      bias: { sensors: { long: 5, mid: 1, short: 0.2 }, policy: { thorough: 4, balanced: 1, dash: 0.2 }, aggression: [0.88, 0.98] } },
+      bias: { sensors: { long: 5, mid: 1, short: 0.2 }, policy: { thorough: 4, balanced: 1, dash: 0.2 }, steering: { diagonal: 2 }, aggression: [0.88, 0.98] } },
     { id: 'apex', name: 'Apex Dynamics', short: 'APX', color: '#ffd166', shape: 'arrow', emblem: 'A',
       bio: 'Featherweight chassis on sticky silicone.',
       bias: { motor: { coreless: 5 }, tires: { silicone: 5 }, battery: { s1: 2, s2: 2, s2xl: 0.3 }, fan: { none: 2, low: 2 }, sensors: { mid: 3, long: 2 } } },
     { id: 'phantom', name: 'Phantom Labs', short: 'PHL', color: '#b388ff', shape: 'stealth', emblem: 'P',
-      bio: 'Vacuum downforce and turn-aware planning.',
-      bias: { fan: { high: 5, low: 2, none: 0.2 }, planner: { turns: 5 }, battery: { s2xl: 4 } } },
+      bio: 'Vacuum downforce, turn-aware planning and diagonal cuts.',
+      bias: { fan: { high: 5, low: 2, none: 0.2 }, planner: { turns: 5 }, battery: { s2xl: 4 }, steering: { diagonal: 5 }, diagPace: [0.5, 0.62] } },
     { id: 'velocity', name: 'Velocity Works', short: 'VEL', color: '#06d6a0', shape: 'needle', emblem: 'W',
-      bio: 'Built for long straights.',
-      bias: { motor: { brushless: 4 }, planner: { turns: 4 }, tires: { urethane: 3 }, policy: { thorough: 2 } } },
+      bio: 'Built for long straights, diagonal ones included.',
+      bias: { motor: { brushless: 4 }, planner: { turns: 4 }, tires: { urethane: 3 }, policy: { thorough: 2 }, steering: { diagonal: 2 } } },
     { id: 'nova', name: 'Nova Robotics', short: 'NOV', color: '#ff9f1c', shape: 'hex', emblem: 'N',
       bio: 'The sensible all-rounder.',
       bias: { aggression: [0.88, 0.96] } },
     { id: 'circuit', name: 'Circuit Breakers', short: 'CBK', color: '#f15bb5', shape: 'box', emblem: 'C',
       bio: 'Gearmotors that leap out of every corner.',
-      bias: { motor: { geared: 5 }, fan: { low: 3, high: 3 }, battery: { s2xl: 3 }, policy: { dash: 2, balanced: 2 } } },
+      bias: { motor: { geared: 5 }, fan: { low: 3, high: 3 }, battery: { s2xl: 3 }, policy: { dash: 2, balanced: 2 }, steering: { diagonal: 2 } } },
     { id: 'pulse', name: 'Pulse Dynamics', short: 'PUL', color: '#9ef01a', shape: 'bug', emblem: 'Ψ',
       bio: 'A wild new concept every season.',
-      bias: { aggression: [0.84, 1.04], searchSpeed: [0.32, 0.62] } },
+      bias: { aggression: [0.84, 1.04], searchSpeed: [0.32, 0.62], diagPace: [0.45, 0.8] } },
   ];
   const TEAM_BY_ID = Object.fromEntries(TEAMS.map((t) => [t.id, t]));
 
@@ -314,6 +330,8 @@
     const ag = bias.aggression || [0.84, 1.01], ss = bias.searchSpeed || [0.33, 0.58];
     b.aggression = round(lerp(ag[0], ag[1], r()), 3);
     b.searchSpeed = round(lerp(ss[0], ss[1], r()), 3);
+    const dp = bias.diagPace || [0.42, 0.68];
+    b.diagPace = round(lerp(dp[0], dp[1], r()), 3);
     // Procedural builds stay sane: a big fan gets a pack that can feed it.
     if (b.fan === 'high' && b.battery === 's1') b.battery = 's2';
     if (b.fan === 'high' && b.policy === 'thorough') b.battery = 's2xl';
@@ -442,6 +460,10 @@
     const cornerPlan = (s) => Math.min(Math.sqrt(((st.grip * normalAt(s)) / st.m) * TURN_R), YAW_K * Math.sqrt(st.motorAccel * s));
     // Overspeed past either limit risks a slide (grip) or clipping a post (yaw).
     const vCornerActual = (c, s) => Math.min(Math.sqrt(((mu(c) * normalAt(s)) / st.m) * TURN_R), YAW_K * Math.sqrt(st.motorAccel * s));
+    const corner45Plan = (s) => Math.min(Math.sqrt(((st.grip * normalAt(s)) / st.m) * TURN_R) * TURN45.grip, YAW_K * Math.sqrt(st.motorAccel * s) * TURN45.yaw);
+    const corner45Actual = (c, s) => Math.min(Math.sqrt(((mu(c) * normalAt(s)) / st.m) * TURN_R) * TURN45.grip, YAW_K * Math.sqrt(st.motorAccel * s) * TURN45.yaw);
+    // Fastest a diagonal can be threaded without clipping a post (glare blinds the sensors).
+    const diagSafeV = () => st.diagRef * st.diagSafe * (env.advanced ? 1 - 0.03 * env.glare : 1);
     const power = (frac) => BASE_W + st.motorW * (0.35 + 0.65 * frac) + st.fanW;
     let flat = false;
     function drain(dt, frac) {
@@ -574,33 +596,42 @@
       }
     }
 
+    // Dijkstra over (cell, heading, last turn). The last turn only matters for
+    // diagonal steering, where a turn opposite to the previous one continues a
+    // zig-zag that the speed run will cut as a straight diagonal.
     function planRoute() {
       const vt = b.aggression * st.cornerSpeed;
       const vs = Math.min(st.vmax, vt * 2.2);
-      const turnCost = b.planner === 'turns' ? TURN_ARC / vt + (vs - vt) ** 2 / (2 * st.accel * vs) : 1.01;
-      const straightCost = b.planner === 'turns' ? CELL / vs : 1;
-      const best = new Float64Array(N * N * 4).fill(Infinity);
-      const prev = new Int32Array(N * N * 4).fill(-1);
+      const vd = Math.min(vs, b.diagPace * st.diagRef);
+      const turns = b.planner === 'turns';
+      const turnCost = turns ? TURN_ARC / vt + (vs - vt) ** 2 / (2 * st.accel * vs) : 1.01;
+      const straightCost = turns ? CELL / vs : 1;
+      const zigCost = turns ? (2 * DIAG_HALF) / vd : 1.005;
+      const best = new Float64Array(N * N * 12).fill(Infinity);
+      const prev = new Int32Array(N * N * 12).fill(-1);
       const h = [];
-      best[START * 4] = 0;
-      heapPush(h, [0, START * 4]);
+      best[START * 12] = 0;
+      heapPush(h, [0, START * 12]);
       let end = -1;
       while (h.length) {
         const [cost, s] = heapPop(h);
         if (cost > best[s]) continue;
-        const c = s >> 2, hd = s & 3;
+        const c = (s / 12) | 0, hd = ((s / 3) | 0) & 3, lt = s % 3;
         if (isGoal(c)) { end = s; break; }
         for (let d = 0; d < 4; d++) {
           if (d === OPP[hd] || kWall[c] & BIT[d]) continue;
           const n = neighbor(c, d);
           if (n < 0 || !visited[n]) continue;
-          const ns = n * 4 + d, nc = cost + (d === hd ? straightCost : turnCost);
+          const turn = d === hd ? 0 : d === (hd + 1) % 4 ? 1 : 2;
+          const zig = st.diagonal && turn && lt && lt !== turn;
+          const nlt = st.diagonal ? turn : 0;
+          const ns = (n * 4 + d) * 3 + nlt, nc = cost + (!turn ? straightCost : zig ? zigCost : turnCost);
           if (nc < best[ns]) { best[ns] = nc; prev[ns] = s; heapPush(h, [nc, ns]); }
         }
       }
       if (end < 0) return null;
       const path = [];
-      for (let s = end; s >= 0; s = prev[s]) path.push(s >> 2);
+      for (let s = end; s >= 0; s = prev[s]) path.push((s / 12) | 0);
       return path.reverse();
     }
 
@@ -613,13 +644,39 @@
       const vmax = st.vmax * s;
       const a = Math.min(st.motorAccel * s, (st.grip * normalAt(s)) / st.m); // planned on nominal grip
       const vt = () => Math.min(vmax, aggression * cornerPlan(s));
+      // Diagonal cells: turning cells inside a zig-zag (alternating turns). A run of
+      // them is driven as one straight diagonal through the edge midpoints.
+      const tdir = (i) => (hd[i] - hd[i - 1] + 4) % 4;
+      const diag = new Uint8Array(L + 1);
+      if (st.diagonal) {
+        for (let i = 1; i < L; i++) {
+          if (turnAt(i) && ((turnAt(i - 1) && tdir(i - 1) !== tdir(i)) || (turnAt(i + 1) && tdir(i + 1) !== tdir(i)))) diag[i] = 1;
+        }
+      }
+      const zig = (i, j) => diag[i] && diag[j] && tdir(i) !== tdir(j);
+      const vt45 = Math.min(vmax, aggression * corner45Plan(s));
+      // The banker run also keeps its diagonals inside the sensors' rated limit.
+      const pace = n === 1 ? Math.min(b.diagPace * RUN_FACTORS[0], st.diagSafe * 0.97) : b.diagPace;
+      const vd = Math.min(vmax, pace * st.diagRef * s);
+      const half = (i) => (diag[i] ? DIAG_HALF : turnAt(i) ? TURN_ARC / 2 : CELL / 2);
       const K = 2 * L;
       const ds = new Float64Array(K), cap = new Float64Array(K + 1).fill(vmax), vel = new Float64Array(K + 1);
+      const capAt = (k, v) => { cap[k] = Math.min(cap[k], v); };
+      // Corner kind at the edge node between cell i and its neighbour j (diagonal cells only).
+      const edgeKind = (i, j) => (zig(i, j) ? 'diag' : diag[j] ? 'v90' : '45');
       for (let i = 0; i < L; i++) {
-        ds[2 * i] = turnAt(i) ? TURN_ARC / 2 : CELL / 2;
-        ds[2 * i + 1] = turnAt(i + 1) ? TURN_ARC / 2 : CELL / 2;
-        if (turnAt(i)) { cap[2 * i] = Math.min(cap[2 * i], vt()); cap[2 * i + 1] = Math.min(cap[2 * i + 1], vt()); }
-        if (turnAt(i + 1)) cap[2 * i + 1] = Math.min(cap[2 * i + 1], vt());
+        ds[2 * i] = half(i);
+        ds[2 * i + 1] = half(i + 1);
+        if (diag[i]) {
+          capAt(2 * i, vd);
+          for (const [k, j] of [[2 * i - 1, i - 1], [2 * i + 1, i + 1]]) {
+            const kind = edgeKind(i, j);
+            capAt(k, kind === 'diag' ? vd : kind === 'v90' ? vt() : vt45);
+          }
+          continue;
+        }
+        if (turnAt(i)) { capAt(2 * i, vt()); capAt(2 * i + 1, vt()); }
+        if (turnAt(i + 1) && !diag[i + 1]) capAt(2 * i + 1, vt());
       }
       cap[0] = 0;
       vel[0] = 0;
@@ -631,15 +688,48 @@
         tn[k + 1] = tn[k] + (sum > 0 ? (2 * ds[k]) / sum : Math.sqrt((2 * ds[k]) / a));
       }
       const t0 = t;
-      let crashAt = -1;
-      for (let i = 1; i < L; i++) {
+      let crashAt = -1, cause = 'corner', diagonals = 0;
+      const crashed = (ratio) => r() < slipChance(ratio);
+      for (let i = 1; i < L && crashAt < 0; i++) {
         if (!turnAt(i)) continue;
-        const ratio = vel[2 * i] / vCornerActual(path[i], s);
-        if (r() < slipChance(ratio)) { crashAt = i; break; }
+        if (!diag[i]) {
+          if (crashed(vel[2 * i] / vCornerActual(path[i], s))) crashAt = i;
+          continue;
+        }
+        // Entering a diagonal: a 45° flick, unless a V90 already turned us onto it.
+        if (!zig(i, i - 1)) {
+          if (!diag[i - 1] && crashed(vel[2 * i - 1] / corner45Actual(path[i], s))) { crashAt = i; break; }
+          // Thread the whole diagonal: the fastest point decides whether a post gets clipped.
+          let j = i, peakK = 2 * i;
+          while (j + 1 < L && zig(j, j + 1)) j++;
+          for (let k = 2 * i; k <= 2 * j; k++) if (vel[k] > vel[peakK]) peakK = k;
+          diagonals++;
+          if (crashed(vel[peakK] / diagSafeV())) { crashAt = Math.max(i, peakK >> 1); cause = 'diagonal'; break; }
+        }
+        // Leaving it: a 45° flick back to the grid, or a V90 onto the next diagonal.
+        if (!zig(i, i + 1)) {
+          const v90 = diag[i + 1];
+          if (crashed(vel[2 * i + 1] / (v90 ? vCornerActual(path[i], s) : corner45Actual(path[i], s)))) crashAt = i;
+        }
       }
+      // Diagonal moves carry waypoints (cell units) so the replay can draw the real line.
+      const centre = (c) => [(c % N) + 0.5, ((c / N) | 0) + 0.5];
+      const edge = (j) => { const [x, y] = centre(path[j]); return [x + DX[hd[j]] / 2, y + DY[hd[j]] / 2]; };
+      const node = (k) => {
+        if (k & 1) return edge(k >> 1);
+        const j = k >> 1;
+        if (!diag[j]) return centre(path[j]);
+        const [ax, ay] = edge(j - 1), [bx, by] = edge(j);
+        return [(ax + bx) / 2, (ay + by) / 2];
+      };
       const lastMove = crashAt >= 0 ? crashAt : L;
       for (let i = 0; i < lastMove; i++) {
-        moves.push({ t0: t0 + tn[2 * i], t1: t0 + tn[2 * i + 2], from: path[i], to: path[i + 1], h: hd[i], ph: 'run' + n, kind: turnAt(i + 1) ? 'turn' : 'straight', v: vel[2 * i + 2] });
+        const m = { t0: t0 + tn[2 * i], t1: t0 + tn[2 * i + 2], from: path[i], to: path[i + 1], h: hd[i], ph: 'run' + n, kind: diag[i + 1] ? 'diag' : turnAt(i + 1) ? 'turn' : 'straight', v: vel[2 * i + 2] };
+        if (diag[i] || diag[i + 1]) {
+          m.tm = t0 + tn[2 * i + 1];
+          m.pts = [node(2 * i), node(2 * i + 1), node(2 * i + 2)].map(([x, y]) => [round(x, 3), round(y, 3)]);
+        }
+        moves.push(m);
       }
       const finishT = t0 + tn[K - 1];
       let peak = 0;
@@ -651,17 +741,17 @@
       let res;
       if (crashAt >= 0) {
         const tc = t0 + tn[2 * crashAt];
-        marks.push({ t: tc, type: 'crash', c: path[crashAt], run: n });
+        marks.push({ t: tc, type: 'crash', c: path[crashAt], run: n, cause });
         t = tc + 0.8;
         drain(t - t0, 1);
         pos = path[crashAt];
-        res = { n, time: null, crashed: true, aggression, at: tc, start: t0, peak, profile };
+        res = { n, time: null, crashed: true, cause, aggression, at: tc, start: t0, peak, profile, diagonals };
       } else {
         marks.push({ t: finishT, type: 'finish', c: path[L], run: n });
         t = t0 + tn[K];
         drain(t - t0, 1);
         pos = path[L]; heading = hd[L - 1];
-        res = { n, time: tn[K - 1], crashed: false, sag: s, aggression, at: finishT, start: t0, peak, profile };
+        res = { n, time: tn[K - 1], crashed: false, sag: s, aggression, at: finishT, start: t0, peak, profile, diagonals };
       }
       return res;
     }
@@ -802,24 +892,27 @@
   }
 
   // ------------------------------------------------------------ share codes
+  // Codes from before diagonal steering (8 keys + 2 numbers) still decode.
   const BUILD_KEYS = ['motor', 'tires', 'fan', 'sensors', 'battery', 'policy', 'planner', 'tieBreak'];
   function encodeBuild(b) {
     b = normalizeBuild(b);
-    return [...BUILD_KEYS.map((k) => b[k]), Math.round(b.aggression * 100), Math.round(b.searchSpeed * 100)].join('.');
+    return [...BUILD_KEYS.map((k) => b[k]), Math.round(b.aggression * 100), Math.round(b.searchSpeed * 100), b.steering, Math.round(b.diagPace * 100)].join('.');
   }
   function decodeBuild(s) {
     const p = String(s || '').split('.');
-    if (p.length !== BUILD_KEYS.length + 2) return null;
+    const n = BUILD_KEYS.length;
+    if (p.length !== n + 2 && p.length !== n + 4) return null;
     const b = {};
     BUILD_KEYS.forEach((k, i) => { b[k] = p[i]; });
-    if (BUILD_KEYS.some((k) => !CATALOG[k][b[k]])) return null;
-    b.aggression = +p[BUILD_KEYS.length] / 100;
-    b.searchSpeed = +p[BUILD_KEYS.length + 1] / 100;
+    if (p.length === n + 4) { b.steering = p[n + 2]; b.diagPace = +p[n + 3] / 100; }
+    if ([...BUILD_KEYS, 'steering'].some((k) => !CATALOG[k][b[k] || DEFAULT_BUILD[k]])) return null;
+    b.aggression = +p[n] / 100;
+    b.searchSpeed = +p[n + 1] / 100;
     return normalizeBuild(b);
   }
 
   return {
-    ENGINE_VERSION, N, CELL, TURN_R, TURN_ARC, BIT, OPP, DX, DY, DIR_NAMES, START, GOALS,
+    ENGINE_VERSION, N, CELL, TURN_R, TURN_ARC, DIAG_HALF, BIT, OPP, DX, DY, DIR_NAMES, START, GOALS,
     MAZE_STYLES, PARTS, POLICIES, PLANNERS, TIEBREAKS, LIMITS, DEFAULT_BUILD, CATALOG, TEAMS, TEAM_BY_ID,
     SCORING, ROUND_NAMES,
     idx, neighbor, dirBetween, isGoal, hashSeed, rngFor, bfs,
