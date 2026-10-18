@@ -112,3 +112,39 @@ test('balance guard: no team dominates and every part option can win', () => {
   for (const [id, n] of Object.entries(titles)) assert.ok(n / seasons < 0.4, `${id} won ${n}/${seasons} titles`);
   assert.ok(Object.values(titles).filter((n) => n > 0).length >= 6, 'most teams win at least once');
 });
+
+test('diagonal steering cuts zig-zags, stays continuous and beats 90° turns at a safe pace', () => {
+  let diagT = 0, orthoT = 0, segs = 0;
+  for (let i = 0; i < 40; i++) {
+    const maze = S.generateMaze(S.hashSeed('diag', i));
+    const base = { ...S.DEFAULT_BUILD, planner: 'turns', diagPace: 0.5 };
+    const d = S.simulateEntrant(maze, { ...base, steering: 'diagonal' }, lab(i), {});
+    const o = S.simulateEntrant(maze, base, lab(i), {});
+    assert.ok(d.best != null && o.best != null, `both finish (maze ${i})`);
+    diagT += d.best; orthoT += o.best;
+    for (const run of d.runs) segs += run.diagonals;
+    assert.ok(o.runs.every((r) => r.diagonals === 0) && o.moves.every((m) => !m.pts));
+    const runMoves = d.moves.filter((m) => m.ph === 'run2');
+    for (let k = 0; k + 1 < runMoves.length; k++) {
+      const a = runMoves[k], b = runMoves[k + 1];
+      if (a.pts) assert.ok(a.tm >= a.t0 && a.tm <= a.t1, 'waypoint time inside the move');
+      if (a.pts && b.pts) assert.deepEqual(a.pts[2], b.pts[0], 'diagonal line is continuous');
+      for (const [x, y] of a.pts || []) {
+        const inFrom = Math.abs(x - ((a.from % S.N) + 0.5)) <= 0.5 && Math.abs(y - (((a.from / S.N) | 0) + 0.5)) <= 0.5;
+        const inTo = Math.abs(x - ((a.to % S.N) + 0.5)) <= 0.5 && Math.abs(y - (((a.to / S.N) | 0) + 0.5)) <= 0.5;
+        assert.ok(inFrom || inTo, 'waypoints stay inside the two cells of the move');
+      }
+    }
+  }
+  assert.ok(segs > 40, 'routes contain diagonals');
+  assert.ok(diagT < orthoT * 0.97, `diagonal ${diagT.toFixed(2)} vs orthogonal ${orthoT.toFixed(2)}`);
+});
+
+test('pre-diagonal share codes still decode; new codes round-trip steering', () => {
+  const old = S.decodeBuild('coreless.urethane.none.mid.s2.balanced.cells.straight.90.45');
+  assert.equal(old.steering, 'orthogonal');
+  assert.equal(old.diagPace, S.DEFAULT_BUILD.diagPace);
+  const b = S.normalizeBuild({ ...S.DEFAULT_BUILD, steering: 'diagonal', diagPace: 0.83 });
+  assert.deepEqual(S.decodeBuild(S.encodeBuild(b)), b);
+  assert.equal(S.decodeBuild('coreless.urethane.none.mid.s2.balanced.cells.straight.90.45.warp.50'), null);
+});

@@ -26,12 +26,15 @@ Every part is a trade-off, and the engineering readout shows why:
 | Suction | none · low · high | downforce for faster corners vs mass and battery drain |
 | Sensors | 1 · 2 · 4 cell IR | seeing dead ends early vs mass and noise in glare |
 | Battery | 1S · 2S · 2S XL | endurance vs mass; a sagging pack also slows the fan |
+| Steering | 90° only · 45° diagonal | cutting zig-zags on a straight diagonal vs 15 g of gyro and sensors |
 | Brains | search policy, route planner, tie-break | search time vs route quality |
-| Tuning | corner aggression, search pace | over 100% aggression risks crashes |
+| Tuning | corner aggression, search pace, diagonal pace | over 100% aggression risks crashes; diagonal pace above the sensor rating risks clipping posts |
 
 Corner speed is `min(grip √(μ·N/m·r), yaw k·√(F/m))`, so heavy fan builds need punchy motors, and light builds corner well too. Beginners can use **Wind-tunnel auto-tune**, which tests 30 builds on practice mazes and keeps the best. **Test lap** runs your build alone.
 
 **Advanced mode** adds seeded randomness the mice can't see coming: dust patches (worse on silicone), slick or grippy surfaces, IR glare that corrupts long-range readings, and cold batteries.
+
+**Diagonal steering.** Searching is always done on the grid. On speed runs, a diagonal mouse drives any run of alternating turns (a zig-zag) as one straight line through the edge midpoints: 0.71 of a cell per step instead of a 0.79-cell arc, with no corner speed cap in between. It pays a 45° flick to get on and off the diagonal, and a V90 where two diagonals meet. Diagonal speed is a share of 2.1× its corner speed, so a heavy chassis gains less. Each sensor package has a safe rating (short 64%, mid 60%, long 52%; IR glare lowers it), and going faster risks clipping a post. The first run stays inside the rating. The turn-aware planner knows zig-zags are cheap and will pick routes full of them.
 
 Builds lock (homologate) when a championship starts.
 

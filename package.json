@@ -1,6 +1,6 @@
 {
   "name": "micromouse-grand-prix",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "private": true,
   "description": "Browser MicroMouse elimination championship with a deterministic simulation engine.",
   "scripts": {
