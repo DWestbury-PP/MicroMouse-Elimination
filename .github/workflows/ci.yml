@@ -15,6 +15,6 @@ jobs:
       - name: Syntax check
         run: node --check js/sim.js && node --check js/app.js && node --check scripts/deploy.js
       - name: Engine tests
-        run: node --test tests/
+        run: node --test tests/*.test.js
       - name: Balance report
         run: node tests/balance.js 150

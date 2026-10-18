@@ -35,7 +35,7 @@ function preflight(allowDirty) {
     sh('git fetch -q origin main');
     if (sh('git rev-parse HEAD') !== sh('git rev-parse origin/main')) die('local main is not in sync with origin/main');
   }
-  try { sh('node --test tests/'); } catch (e) { die('tests failed:\n' + (e.stdout || '') + (e.stderr || '')); }
+  try { sh('node --test tests/*.test.js'); } catch (e) { die('tests failed:\n' + (e.stdout || '') + (e.stderr || '')); }
   for (const f of Object.keys(FILES)) if (!fs.existsSync(f)) die('missing ' + f);
 }
 
